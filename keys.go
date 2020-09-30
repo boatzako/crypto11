@@ -215,6 +215,78 @@ func (c *Context) makeKeyPair(session *pkcs11Session, privHandle *pkcs11.ObjectH
 	}
 }
 
+// Takes a handles to the private and public and constructs a keypair object from them both.
+func (c *Context) makeDifferentLabelKeyPair(session *pkcs11Session, pubHandle, privHandle *pkcs11.ObjectHandle) (signer Signer, err error) {
+	if pubHandle == nil {
+		// We can't return a Signer if we don't have private and public key. Treat it as an error.
+		return nil, errNoPublicHalf
+	}
+
+	attributes := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_ID, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, 0),
+	}
+	if attributes, err = session.ctx.GetAttributeValue(session.handle, *privHandle, attributes); err != nil {
+		return nil, err
+	}
+	id := attributes[0].Value
+	keyType := bytesToUlong(attributes[2].Value)
+
+	// Ensure the private key actually has a non-empty CKA_ID to match on
+	if id == nil || len(id) == 0 {
+		return nil, errNoCkaId
+	}
+
+	var pub crypto.PublicKey
+	switch keyType {
+	case pkcs11.CKK_DSA:
+		if pub, err = exportDSAPublicKey(session, *pubHandle); err != nil {
+			return nil, err
+		}
+		return &pkcs11PrivateKeyDSA{
+			pkcs11PrivateKey: pkcs11PrivateKey{
+				pkcs11Object: pkcs11Object{
+					handle:  *privHandle,
+					context: c,
+				},
+				pubKeyHandle: *pubHandle,
+				pubKey:       pub,
+			}}, nil
+
+	case pkcs11.CKK_RSA:
+		if pub, err = exportRSAPublicKey(session, *pubHandle); err != nil {
+			return nil, err
+		}
+		return &pkcs11PrivateKeyRSA{
+			pkcs11PrivateKey: pkcs11PrivateKey{
+				pkcs11Object: pkcs11Object{
+					handle:  *privHandle,
+					context: c,
+				},
+				pubKeyHandle: *pubHandle,
+				pubKey:       pub,
+			}}, nil
+
+	case pkcs11.CKK_ECDSA:
+		if pub, err = exportECDSAPublicKey(session, *pubHandle); err != nil {
+			return nil, err
+		}
+		return &pkcs11PrivateKeyECDSA{
+			pkcs11PrivateKey: pkcs11PrivateKey{
+				pkcs11Object: pkcs11Object{
+					handle:  *privHandle,
+					context: c,
+				},
+				pubKeyHandle: *pubHandle,
+				pubKey:       pub,
+			}}, nil
+
+	default:
+		return nil, errors.Errorf("unsupported key type: %X", keyType)
+	}
+}
+
 // FindKeyPair retrieves a previously created asymmetric key pair, or nil if it cannot be found.
 //
 // At least one of id and label must be specified.
@@ -227,6 +299,27 @@ func (c *Context) FindKeyPair(id []byte, label []byte) (Signer, error) {
 	}
 
 	result, err := c.FindKeyPairs(id, label)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(result) == 0 {
+		return nil, nil
+	}
+
+	return result[0], nil
+}
+
+// FindDifferentLabelKeyPair retrieves a previously created asymmetric key pair, or nil if it cannot be found.
+//
+// Same as FindKeyPair function.
+// But allow to set different public key and private label for whom mistaken imported different public key and private key labels on HSM.
+func (c *Context) FindDifferentLabelKeyPair(pubLabel []byte, privLabel []byte) (Signer, error) {
+	if c.closed.Get() {
+		return nil, errClosed
+	}
+
+	result, err := c.FindDifferentLabelKeyPairs(pubLabel, privLabel)
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +362,40 @@ func (c *Context) FindKeyPairs(id []byte, label []byte) (signer []Signer, err er
 	}
 
 	return c.FindKeyPairsWithAttributes(attributes)
+}
+
+// FindDifferentLabelKeyPairs retrieves all matching asymmetric key pairs, or a nil slice if none can be found.
+//
+// Same as FindKeyPairs function.
+// But allow to set different public key and private label for whom mistaken imported different public key and private key labels on HSM.
+func (c *Context) FindDifferentLabelKeyPairs(pubLabel []byte, privLabel []byte) (signer []Signer, err error) {
+	if c.closed.Get() {
+		return nil, errClosed
+	}
+
+	if pubLabel == nil {
+		return nil, errors.New("label cannot be nil")
+	}
+
+	pubAttributes := NewAttributeSet()
+
+	err = pubAttributes.Set(CkaLabel, pubLabel)
+	if err != nil {
+		return nil, err
+	}
+
+	if privLabel == nil {
+		return nil, errors.New("label cannot be nil")
+	}
+
+	privAttributes := NewAttributeSet()
+
+	err = privAttributes.Set(CkaLabel, privLabel)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.FindDifferentLabelKeyPairsWithAttributes(pubAttributes, privAttributes)
 }
 
 // FindKeyPairWithAttributes retrieves a previously created asymmetric key pair, or nil if it cannot be found.
@@ -337,6 +464,61 @@ func (c *Context) FindKeyPairsWithAttributes(attributes AttributeSet) (signer []
 			}
 
 			keys = append(keys, k)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return keys, nil
+}
+
+// FindDifferentLabelKeyPairsWithAttributes retrieves previously created asymmetric key pairs, or nil if none can be found.
+//
+// Same as FindKeyPairsWithAttributes function.
+// But allow to set different public key and private label for whom mistaken imported different public key and private key labels on HSM.
+func (c *Context) FindDifferentLabelKeyPairsWithAttributes(pubAttributes, privAttributes AttributeSet) (signer []Signer, err error) {
+	if c.closed.Get() {
+		return nil, errClosed
+	}
+
+	var keys []Signer
+
+	err = pubAttributes.Set(CkaClass, pkcs11.CKO_PUBLIC_KEY)
+	if err != nil {
+		return nil, err
+	}
+	err = privAttributes.Set(CkaClass, pkcs11.CKO_PRIVATE_KEY)
+	if err != nil {
+		return nil, err
+	}
+
+	err = c.withSession(func(session *pkcs11Session) error {
+		privHandles, err := findKeysWithAttributes(session, privAttributes.ToSlice())
+		if err != nil {
+			return err
+		}
+		pubHandles, err := findKeysWithAttributes(session, pubAttributes.ToSlice())
+		if err != nil {
+			return err
+		}
+
+		for _, privHandle := range privHandles {
+			for _, pubHandle := range pubHandles {
+				k, err := c.makeDifferentLabelKeyPair(session, &pubHandle, &privHandle)
+
+				if err == errNoCkaId || err == errNoPublicHalf {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+
+				keys = append(keys, k)
+			}
 		}
 
 		return nil
